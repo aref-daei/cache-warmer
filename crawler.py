@@ -1,19 +1,19 @@
 import argparse
-import time
-import random
 import logging
+import random
 import sys
 import threading
-from urllib.parse import urlparse, urljoin
+import time
 from queue import Queue
+from urllib.parse import urlparse, urljoin
 
-from selenium import webdriver
-from selenium.webdriver.firefox.service import Service as FirefoxService
-from selenium.webdriver.firefox.options import Options as FirefoxOptions
-from selenium.common.exceptions import WebDriverException
-from webdriver_manager.firefox import GeckoDriverManager
 from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.common.exceptions import WebDriverException
+from selenium.webdriver.firefox.options import Options as FirefoxOptions
+from selenium.webdriver.firefox.service import Service as FirefoxService
 from tqdm import tqdm
+from webdriver_manager.firefox import GeckoDriverManager
 
 # Disable the verbose logs from webdriver-manager
 logging.getLogger('WDM').setLevel(logging.WARNING)
