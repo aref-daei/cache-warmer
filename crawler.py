@@ -1,28 +1,30 @@
 import argparse
-import logging
-import random
-import sys
 import time
-from queue import Queue
+import random
+import logging
+import sys
+import threading
 from urllib.parse import urlparse, urljoin
+from queue import Queue
 
-from bs4 import BeautifulSoup
 from selenium import webdriver
-from selenium.common.exceptions import WebDriverException
-from selenium.webdriver.firefox.options import Options as FirefoxOptions
 from selenium.webdriver.firefox.service import Service as FirefoxService
-from tqdm import tqdm
+from selenium.webdriver.firefox.options import Options as FirefoxOptions
+from selenium.common.exceptions import WebDriverException
 from webdriver_manager.firefox import GeckoDriverManager
+from bs4 import BeautifulSoup
+from tqdm import tqdm
 
 # Disable the verbose logs from webdriver-manager
 logging.getLogger('WDM').setLevel(logging.WARNING)
 
 
-def setup_driver():
-    """Sets up a headless Firefox driver."""
+def setup_driver(show_browser=False):
+    """Sets up a Firefox driver."""
     options = FirefoxOptions()
-    options.add_argument("--headless")
-    options.add_argument("--disable-gpu")
+    if not show_browser:
+        options.add_argument("--headless")
+        options.add_argument("--disable-gpu")
 
     try:
         service = FirefoxService(GeckoDriverManager().install())
@@ -70,55 +72,40 @@ def get_internal_links(driver, base_url, domain):
     return links
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Single-worker website crawler for cache warming.")
-    parser.add_argument("url", help="The root URL of the website to start crawling.")
-    parser.add_argument("--limit", type=int, default=50, help="Maximum number of pages to visit (default: 50).")
-    parser.add_argument("--delay", default="1-3", help="Random delay range between requests (e.g., '1-3' seconds).")
-    parser.add_argument("--scroll", action="store_true", help="Enable automatic scrolling on each page.")
-    parser.add_argument("--js-wait", type=int, default=2, help="Time (seconds) to wait for JS to execute (default: 2).")
-
-    args = parser.parse_args()
-
-    # --- Initial Setup ---
-    base_url = args.url
-    domain = urlparse(base_url).netloc
-    if not domain:
-        print("Invalid URL. Please start with http:// or https://", file=sys.stderr)
-        sys.exit(1)
+def worker(queue, visited_links, visited_lock, successful_pages, failed_pages, report_lock, pbar, args, base_url,
+           domain):
+    """The main worker thread function."""
 
     # Parse delay
     try:
         min_delay, max_delay = map(float, args.delay.split('-'))
     except ValueError:
-        print("Invalid delay format. Use 'min-max'.", file=sys.stderr)
-        sys.exit(1)
+        min_delay, max_delay = 1.0, 3.0  # Fallback
 
-    # --- Prepare for Crawl ---
-    links_to_visit = Queue()
-    links_to_visit.put(base_url)
-    visited_links = set()
-    successful_pages = []
-    failed_pages = {}
+    while True:
+        current_url = queue.get()
 
-    print(f"[*] Starting crawl at {base_url} (Domain lock: {domain})")
-    print(f"[*] Page Limit: {args.limit}")
-    print(f"[*] Delay: {min_delay}s to {max_delay}s")
+        # Sentinel value: None means "stop working"
+        if current_url is None:
+            queue.task_done()
+            break
 
-    pbar = tqdm(total=args.limit, desc="Crawling Pages", unit="page")
+        should_process = False
+        with visited_lock:
+            # Check if we should process this URL
+            if current_url not in visited_links and pbar.n < args.limit:
+                should_process = True
+                visited_links.add(current_url)
 
-    # --- Main Crawl Loop ---
-    while not links_to_visit.empty() and len(visited_links) < args.limit:
-        current_url = links_to_visit.get()
-
-        if current_url in visited_links:
+        if not should_process:
+            queue.task_done()
             continue
 
-        visited_links.add(current_url)
+        # --- This thread is now responsible for processing current_url ---
 
         driver = None
         try:
-            driver = setup_driver()
+            driver = setup_driver(args.show_browser)
             if not driver:
                 raise Exception("WebDriver setup failed.")
 
@@ -135,17 +122,24 @@ def main():
 
             # Extract links
             new_links = get_internal_links(driver, base_url, domain)
-            for link in new_links:
-                if link not in visited_links:
-                    links_to_visit.put(link)
 
-            successful_pages.append(current_url)
-            pbar.update(1)
-            pbar.set_postfix(Queue=links_to_visit.qsize())
+            # Add new, unvisited links to the queue
+            with visited_lock:
+                for link in new_links:
+                    if link not in visited_links:
+                        queue.put(link)
+
+            # Report success
+            with report_lock:
+                successful_pages.append(current_url)
+
+            pbar.update(1)  # Update progress bar
 
         except Exception as e:
-            failed_pages[current_url] = str(e)
-            print(f"\n[!] Error visiting {current_url}: {e}", file=sys.stderr)
+            # Report failure
+            with report_lock:
+                failed_pages[current_url] = str(e)
+                print(f"\n[!] Error visiting {current_url}: {e}", file=sys.stderr)
 
         finally:
             if driver:
@@ -154,6 +148,71 @@ def main():
             # Apply random delay
             delay = random.uniform(min_delay, max_delay)
             time.sleep(delay)
+
+            # Mark this task as done
+            queue.task_done()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Multi-worker website crawler for cache warming.")
+    parser.add_argument("url", help="The root URL of the website to start crawling.")
+    parser.add_argument("--limit", type=int, default=10, help="Maximum number of pages to visit (default: 50).")
+    parser.add_argument("--workers", type=int, default=1, help="Number of concurrent workers (default: 3).")
+    parser.add_argument("--delay", default="1-3", help="Random delay range between requests (e.g., '1-3' seconds).")
+    parser.add_argument("--scroll", action="store_true", help="Enable automatic scrolling on each page.")
+    parser.add_argument("--js-wait", type=int, default=2, help="Time (seconds) to wait for JS to execute (default: 2).")
+    parser.add_argument("--show-browser", action="store_true",
+                        help="Show the browser (disable headless mode) for debugging.")
+
+    args = parser.parse_args()
+
+    # --- Initial Setup ---
+    base_url = args.url
+    domain = urlparse(base_url).netloc
+    if not domain:
+        print("Invalid URL. Please start with http:// or https://", file=sys.stderr)
+        sys.exit(1)
+
+    # --- Prepare for Crawl (Thread-safe structures) ---
+    links_to_visit = Queue()
+    visited_links = set()
+    visited_lock = threading.Lock()  # To protect visited_links and queue.put
+
+    successful_pages = []
+    failed_pages = {}
+    report_lock = threading.Lock()  # To protect successful_pages and failed_pages
+
+    pbar = tqdm(total=args.limit, desc="Crawling Pages", unit="page")
+
+    threads = []
+
+    print(f"[*] Starting crawl at {base_url} with {args.workers} workers.")
+    print(f"[*] Page Limit: {args.limit}")
+
+    # --- Start Workers ---
+    for _ in range(args.workers):
+        t = threading.Thread(target=worker, args=(
+            links_to_visit, visited_links, visited_lock,
+            successful_pages, failed_pages, report_lock,
+            pbar, args, base_url, domain
+        ))
+        t.daemon = True  # Threads will exit when main program exits
+        t.start()
+        threads.append(t)
+
+    # Add the starting URL
+    links_to_visit.put(base_url)
+
+    # Wait for all tasks in the queue to be processed
+    links_to_visit.join()
+
+    # Stop the workers by sending sentinel values
+    for _ in range(args.workers):
+        links_to_visit.put(None)
+
+    # Wait for all threads to finish
+    for t in threads:
+        t.join()
 
     pbar.close()
 
