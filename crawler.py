@@ -19,6 +19,8 @@ from webdriver_manager.firefox import GeckoDriverManager
 logging.getLogger('WDM').setLevel(logging.WARNING)
 
 
+# --- Functions (setup_driver, scroll_page, get_internal_links) remain unchanged ---
+
 def setup_driver(show_browser=False):
     """Sets up a Firefox driver."""
     options = FirefoxOptions()
@@ -26,15 +28,20 @@ def setup_driver(show_browser=False):
         options.add_argument("--headless")
         options.add_argument("--disable-gpu")
 
+    # IMPORTANT: GeckoDriverManager().install() is the call that hits the GitHub API.
+    # It checks for the latest version. If the driver is already cached and up-to-date,
+    # it should be fast and not trigger the rate limit.
     try:
         service = FirefoxService(GeckoDriverManager().install())
         driver = webdriver.Firefox(service=service, options=options)
         return driver
     except Exception as e:
+        # We print to stderr here since stdout is used by tqdm
         print(f"Error setting up WebDriver: {e}", file=sys.stderr)
         return None
 
 
+# (scroll_page function is omitted for brevity but should be included)
 def scroll_page(driver, scroll_delay=0.5):
     """Scrolls the entire page down to load dynamic content."""
     try:
@@ -47,9 +54,10 @@ def scroll_page(driver, scroll_delay=0.5):
                 break
             last_height = new_height
     except WebDriverException:
-        pass  # Page might close during scroll
+        pass
 
 
+# (get_internal_links function is omitted for brevity but should be included)
 def get_internal_links(driver, base_url, domain):
     """Extracts all internal links from the page using BeautifulSoup."""
     links = set()
@@ -74,7 +82,7 @@ def get_internal_links(driver, base_url, domain):
 
 def worker(queue, visited_links, visited_lock, successful_pages, failed_pages, report_lock, pbar, args, base_url,
            domain):
-    """The main worker thread function."""
+    """The main worker thread function. Each worker sets up its own driver."""
 
     # Parse delay
     try:
@@ -82,6 +90,23 @@ def worker(queue, visited_links, visited_lock, successful_pages, failed_pages, r
     except ValueError:
         min_delay, max_delay = 1.0, 3.0  # Fallback
 
+    driver = None
+    try:
+        # Setup driver for this specific thread
+        driver = setup_driver(args.show_browser)
+        if not driver:
+            raise Exception("Driver setup failed for this worker.")
+    except Exception as e:
+        with report_lock:
+            print(f"\n[!] Critical Error: Worker failed to initialize driver. {e}", file=sys.stderr)
+        # If driver setup fails, this worker cannot do anything.
+        while not queue.empty():
+            queue.get()  # Consume remaining items to avoid deadlock
+            queue.task_done()
+        queue.put(None)  # Put sentinel back to stop other workers if necessary
+        return
+
+    # --- Main Worker Loop ---
     while True:
         current_url = queue.get()
 
@@ -101,14 +126,9 @@ def worker(queue, visited_links, visited_lock, successful_pages, failed_pages, r
             queue.task_done()
             continue
 
-        # --- This thread is now responsible for processing current_url ---
+        # --- Process the URL ---
 
-        driver = None
         try:
-            driver = setup_driver(args.show_browser)
-            if not driver:
-                raise Exception("WebDriver setup failed.")
-
             # Visit the page
             driver.get(current_url)
 
@@ -142,9 +162,6 @@ def worker(queue, visited_links, visited_lock, successful_pages, failed_pages, r
                 print(f"\n[!] Error visiting {current_url}: {e}", file=sys.stderr)
 
         finally:
-            if driver:
-                driver.quit()
-
             # Apply random delay
             delay = random.uniform(min_delay, max_delay)
             time.sleep(delay)
@@ -152,12 +169,16 @@ def worker(queue, visited_links, visited_lock, successful_pages, failed_pages, r
             # Mark this task as done
             queue.task_done()
 
+    # Clean up the thread's driver after the loop finishes
+    if driver:
+        driver.quit()
+
 
 def main():
     parser = argparse.ArgumentParser(description="Multi-worker website crawler for cache warming.")
     parser.add_argument("url", help="The root URL of the website to start crawling.")
-    parser.add_argument("--limit", type=int, default=10, help="Maximum number of pages to visit (default: 50).")
-    parser.add_argument("--workers", type=int, default=1, help="Number of concurrent workers (default: 3).")
+    parser.add_argument("--limit", type=int, default=50, help="Maximum number of pages to visit (default: 50).")
+    parser.add_argument("--workers", type=int, default=3, help="Number of concurrent workers (default: 3).")
     parser.add_argument("--delay", default="1-3", help="Random delay range between requests (e.g., '1-3' seconds).")
     parser.add_argument("--scroll", action="store_true", help="Enable automatic scrolling on each page.")
     parser.add_argument("--js-wait", type=int, default=2, help="Time (seconds) to wait for JS to execute (default: 2).")
