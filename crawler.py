@@ -90,7 +90,6 @@ def worker(queue, visited_links, visited_lock, successful_pages, failed_pages, r
     except ValueError:
         min_delay, max_delay = 1.0, 3.0  # Fallback
 
-    driver = None
     try:
         # Setup driver for this specific thread
         driver = setup_driver(args.show_browser)
